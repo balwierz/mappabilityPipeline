@@ -10,33 +10,35 @@ use File::Temp qw/ tempfile tempdir /;
 my $assembly = shift @ARGV;  # eg "danRer10"
 my $alreadyMappableF = shift @ARGV;  # output file
 my $nThreads = shift @ARGV or die;	# bowtie threads. 
-							# There will be 3 more processes: samtools, bam2mappablePositions and this script.
+					# There will be 3 more processes: samtools, bam2mappablePositions and this script.
 
 # config:
 my $minLen = 20;
-my $maxLen = 30;
+my $maxLen = 150;
 my $faF = (-e "/mnt/biggles/data/UCSC/goldenpath/$assembly/bigZips/$assembly.fa.gz") ?
 			"/mnt/biggles/data/UCSC/goldenpath/$assembly/bigZips/$assembly.fa.gz" :
 			"/mnt/biggles/data/UCSC/goldenpath/$assembly/bigZips/$assembly.fa";
 my $scratchDir = "/mnt/scratch/" . $ENV{USER};
 
 # params to programs:
-my $bowtieParams   = 	"--mm --phred33-quals --threads $nThreads" .
+my $bowtieParams   = 	" --phred33-quals --threads $nThreads" .
 						" -x /mnt/biggles/data/alignment_references/bowtie2/$assembly --no-unal";
 my $samtoolsParams = "-S -q 10";	# you can increase quality to 20 or even 30 if you wish
 
-### read chromosomes in:
-my %genome = %{readGenome($faF)}; #keys {chr}, value: seq
-
 ### init:
 die "Cannot fine $faF" if ! -e $faF;
-my %needToCheck = ();  #meaning: undef=unmappable even at masLen; 0=need to check; non-zero=the done result
+my %needToCheck = (); # {chr}[pos]
+	#meaning: -1=unmappable even at maxLen; 0=need to check; non-zero=the result
 my $tmpDir = tempdir( TEMPLATE => 'mappability.XXXXX', DIR => $scratchDir, CLEANUP => 0 );
+
+### read chromosomes in:
+my %genome = %{readGenome($faF, \%needToCheck)}; #keys {chr}, value: seq
 
 ### Optimisation: solve really bad regions by finding unmapped positions at
 ### maxReadlength. Save mappable positions to %needToCheck
 my $wholeGenomeLongChopF = spitOut($maxLen, 1);
 mapWithBowtie($maxLen, $wholeGenomeLongChopF, 1, "/dev/null");
+unlink($wholeGenomeLongChopF);
 
 ### the main loop over read length:
 ### - chop the genome
@@ -67,7 +69,7 @@ sub produceBigWig
 		print $chrLenH $chr, "\t", length($genome{$chr}), "\n";
 		for(my $i=1; $i<=length($genome{$chr}); $i++)
 		{
-			my $thisVal = (defined $needToCheck{$chr}{$i}) ? $needToCheck{$chr}{$i} : $maxLen;
+			my $thisVal = (-1 == $needToCheck{$chr}[$i]) ? $needToCheck{$chr}[$i] : $maxLen;
 			print $sortOutH join("\t", $chr, $i-1, $i, $thisVal), "\n";
 		}
 	}
@@ -83,9 +85,9 @@ sub mapWithBowtie
 	$rLen = int($rLen);  #maybe it saves us some memory instead of strings???
 	open(BOWTIE,	"bowtie2 $bowtieParams -U $infile | " .
 					"samtools view $samtoolsParams | " .
-					"./bam2mappablePositions2 |") or die "cannot start mapping";
+					"./bam2mappablePositions2 |") or die "cannot start mapping: $!";
 
-	open(my $oH, ">>", $outF) or die;
+	#open(my $oH, ">>", $outF) or die;
 	while(<BOWTIE>)
 	{
 		chomp;
@@ -93,18 +95,18 @@ sub mapWithBowtie
 		# update the the hash:
 		if($reverse)
 		{
-			$needToCheck{$chr}{$pos} = 0;
+			$needToCheck{$chr}[$pos] = 0;
 		}
 		else
 		{
 			# we just mapped it successfully. Let's save the result
-			$needToCheck{$chr}{$pos} = $rLen;
+			$needToCheck{$chr}[$pos] = $rLen;
 			# update the big file (obsolete right now!):
-			print $oH $chr, "\t", $pos, "\t", $rLen, "\n";
+			# print $oH $chr, "\t", $pos, "\t", $rLen, "\n";
 		}
 	}
 	close(BOWTIE);
-	close($oH);
+	#close($oH);
 }
 
 sub spitOut
@@ -119,7 +121,7 @@ sub spitOut
 		my $seq = $genome{$chr};
 		for(my $i=1; $i<=length($seq) - $readLen + 1; $i++)
 		{
-			if($doWholeGenomeBool || (defined $needToCheck{$chr}{$i} && $needToCheck{$chr}{$i} == 0))
+			if($doWholeGenomeBool || $needToCheck{$chr}[$i] == 0)
 			{
 				print $oH '@'.$chr.":".($i)."-".($i+$readLen-1), "\n";
 				print $oH substr($seq, $i-1, $readLen), "\n";
@@ -138,7 +140,7 @@ sub spitOut
 
 sub readGenome
 {
-	my($faF) = @_;	
+	my($faF, $h) = @_;
 	my $seq = "";
 	my $chr = "";
 	my %genome;
@@ -151,6 +153,7 @@ sub readGenome
 			if($chr)
 			{
 				$genome{$chr} = $seq;
+				@{$h->{$chr}} = (-1) x (1+length($seq));
 			}
 			$seq = "";
 			$chr = $1;
@@ -162,5 +165,6 @@ sub readGenome
 	}
 	$faH->close() ;
 	$genome{$chr} = $seq;
+	@{$h->{$chr}} = (-1) x (1 + length($seq));
 	return \%genome;
 }
